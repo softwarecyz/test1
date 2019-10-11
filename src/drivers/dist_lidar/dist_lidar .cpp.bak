@@ -1,0 +1,903 @@
+/****************************************************************************
+ *
+ *   Copyright (c) 2012-2015 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+/**
+ * @file batt_smart.cpp
+ *
+ *
+ * @author phil@tenx_eprom@sina.com
+ */
+#ifdef __PX4_NUTTX
+#include <nuttx/clock.h>
+#include <nuttx/arch.h>
+#endif
+
+#ifndef __PX4_QURT
+#include <termios.h>
+#include <poll.h>
+#else
+#include <sys/ioctl.h>
+#include <dev_fs_lib_serial.h>
+#endif
+
+#include <px4_config.h>
+#include <sys/types.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <string.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <stdio.h>
+#include <math.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <nuttx/arch.h>
+#include <nuttx/wqueue.h>
+#include <nuttx/clock.h>
+#include <board_config.h>
+#include <mathlib/mathlib.h>
+#include <perf/perf_counter.h>
+#include <systemlib/err.h>
+#include <px4_workqueue.h>
+#include <systemlib/mavlink_log.h>
+#include <uORB/uORB.h>
+ 
+#include <float.h>
+#include <drivers/drv_hrt.h>
+#include <drivers/device/ringbuffer.h>
+#include <ecl/geo/geo.h>
+#include <px4_tasks.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <drivers/device/device.h>
+#include <arch/board/board.h>
+#include <parameters/param.h>
+#include <systemlib/err.h>
+#include <systemlib/mavlink_log.h>
+#include <dataman/dataman.h>
+#include <matrix/math.hpp>
+
+
+#define BATT_DEFAULT_UART_PORT   	"/dev/ttyS6"
+#define BATT_DEFAULT_UART_BAUD   	115200
+
+#define TIMEOUT_5HZ			200
+#define BATT_WAIT_BEFORE_READ		2			//ms
+#define CONNECT_TIMEOUT_MS		15000
+
+
+#define BATT_SMBUS_PEC_POLYNOMIAL	0x07	///< Polynomial for calculating PEC
+
+
+#define PEC_BUFFER_SIZE			80
+
+
+enum batbus_status
+{
+	wait_head = 0,
+	wait_command,
+	wait_adrsn,
+	wait_paramnum,
+	wait_sot,
+	wait_param,
+	wait_pec,
+	wait_eot,
+};
+
+
+#define BATT_BUS_HEAD			0xAA
+#define BATT_BUS_SOT			0xBB
+#define BATT_BUS_EOT			0xCC
+
+#define BATTERY_DATA_CMD		1
+
+class BATT_SMART
+{
+public:
+	BATT_SMART(const char *uart_path);
+	virtual ~BATT_SMART();
+
+	int 		init();
+	ssize_t		read(struct file *filp, char *buffer, size_t buflen);
+	int 		test();
+	void		shut();
+
+	/**
+	 * Diagnostics - print some basic information about the driver.
+	 */
+	void		print_info();
+
+protected:
+	int		probe();
+
+private:
+	// internal variables
+	bool			_task_should_exit;				///< flag to make the main worker task exit
+	bool			_enabled;					///< true if we have successfully connected to battery
+	volatile int		_task;						///< worker task
+	uint64_t		_start_time;					///< system time we first attempt to communicate with battery
+
+	int			_serial_fd;					///< serial interface to GPS
+	char			_port[20];					///< device / serial port path
+
+	uint8_t 		_buf[PEC_BUFFER_SIZE+7+5];
+
+	bool   			_shut;    //for test connect lose
+	/**
+	 * Initialise the automatic measurement state machine and start it.
+	 *
+	 * @note This function is called at open and error time.  It might make sense
+	 *       to make it more aggressive about resetting the bus in case of errors.
+	 */
+	void				start();
+
+	/**
+	 * Stop the automatic measurement state machine.
+	 */
+	void				stop();
+
+	/**
+	 * Trampoline to the worker task
+	 */
+	static void task_main_trampoline(int argc, char *argv[]);
+
+	/**
+	 * Worker task: main GPS thread that configures the GPS and parses incoming data, always running
+	 */
+	void task_main(void);
+
+	/**
+	 * set the Baudrate
+	 * @param baud
+	 * @return 0 on success, <0 on error
+	 */
+	int setBaudrate(unsigned baud);
+
+	/**
+	 * This is an abstraction for the poll on serial used.
+	 *
+	 * @param buf: pointer to read buffer
+	 * @param buf_length: size of read buffer
+	 * @param timeout: timeout in ms
+	 * @return: 0 for nothing read, or poll timed out
+	 *	    < 0 for error
+	 *	    > 0 number of bytes read
+	 */
+	int pollOrRead(uint8_t *buf, size_t buf_length, int timeout);
+
+	int receive(unsigned timeout);
+	int handleMessage(int len);
+	void printStatus();
+	int parseChar(uint8_t b);
+	void publish();
+	void poll_subscriptions();
+
+
+};
+
+
+/*
+ * Driver 'main' command.
+ */
+extern "C" __EXPORT int dist_lidar_main(int argc, char *argv[]);
+
+namespace
+{
+BATT_SMART	*g_dev = nullptr;
+}
+
+
+BATT_SMART::BATT_SMART(const char *uart_path):
+	_task_should_exit(false),
+	_enabled(false),
+	_start_time(0),
+	_serial_fd(-1),
+	_shut(false)
+{
+	/* store port name */
+	strncpy(_port, uart_path, sizeof(_port));
+	/* enforce null termination */
+	_port[sizeof(_port) - 1] = '\0';
+
+	// capture startup time
+	_start_time = hrt_absolute_time();
+}
+
+
+BATT_SMART::~BATT_SMART()
+{
+	/* tell the task we want it to go away */
+	_task_should_exit = true;
+
+	/* spin waiting for the task to stop */
+	for (unsigned i = 0; (i < 10) && (_task != -1); i++) {
+		/* give it another 100ms */
+		usleep(100000);
+	}
+
+	/* well, kill it anyway, though this will probably crash */
+	if (_task != -1) {
+		px4_task_delete(_task);
+	}
+
+}
+
+// int
+// TEMP_MOTOR::init()
+// {
+// 	int ret = ENOTTY;
+
+// 	ret = work_queue(HPWORK, &_work, (worker_t)&BATT_SMART::cycle_trampoline, this, USEC2TICK(TEMP_SMBUS_MEASUREMENT_INTERVAL_US));
+
+// 	return ret;
+// }
+
+int
+BATT_SMART::init()
+{
+	/* start the GPS driver worker task */
+	_task = px4_task_spawn_cmd("batt_smart", SCHED_DEFAULT,
+				   SCHED_PRIORITY_SLOW_DRIVER, 1600, (px4_main_t)&BATT_SMART::task_main_trampoline, NULL);
+
+	if (_task < 0) {
+		PX4_WARN("task start failed: %d", errno);
+		_task = -1;
+		return -errno;
+	}
+
+	return OK;
+}
+
+void BATT_SMART::task_main_trampoline(int argc, char *argv[])
+{
+	g_dev->task_main();
+}
+
+void
+BATT_SMART::task_main()
+{
+	/* open the serial port */
+	_serial_fd = ::open(_port, O_RDWR | O_NOCTTY);
+
+	if (_serial_fd < 0) {
+		PX4_ERR("BATT_SMART: failed to open serial port: %s err: %d", _port, errno);
+
+		/* tell the dtor that we are exiting, set error code */
+		_task = -1;
+		px4_task_exit(1);
+	}
+	else
+	{
+		printf("open port:%s success\n", _port);
+	}
+
+#ifndef __PX4_QURT
+	// TODO: this call is not supported on Snapdragon just yet.
+	// However it seems to be nonblocking anyway and working.
+	int flags = fcntl(_serial_fd, F_GETFL, 0);
+	fcntl(_serial_fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+	setBaudrate(BATT_DEFAULT_UART_BAUD);
+
+	int ret;
+	uint64_t time_last_recv = hrt_absolute_time();
+
+
+	uint64_t lidar_time = 0;
+
+	/* loop handling received serial bytes and also configuring in between */
+	while (!_task_should_exit) {
+
+		//updateParam();
+		poll_subscriptions();
+
+		float lidar_hz = 1e6/(hrt_absolute_time() - lidar_time);
+		lidar_time = hrt_absolute_time();
+		PX4_WARN("lidar_hz %.2f",(double)lidar_hz);
+
+		ret = receive(TIMEOUT_5HZ);
+
+		if (ret > 0) {
+			time_last_recv = hrt_absolute_time();
+			//printf("publish\n");
+			//_smart_battery_status.connect_lost = false;
+		}
+		else
+		{
+			if(time_last_recv - hrt_absolute_time() > 20000000)
+			{
+				//printf("lost\n");
+				//_smart_battery_status.connect_lost = true;
+			}
+		}
+
+		//_smart_battery_status.timestamp = hrt_absolute_time();
+		publish();
+
+
+	}
+
+	PX4_WARN("exiting");
+
+	::close(_serial_fd);
+
+	/* tell the dtor that we are exiting */
+	_task = -1;
+	px4_task_exit(0);
+}
+
+void BATT_SMART::publish()
+{
+
+
+}
+
+
+void BATT_SMART::poll_subscriptions()
+{
+
+}
+
+
+int BATT_SMART::setBaudrate(unsigned baud)
+{
+
+#if __PX4_QURT
+	// TODO: currently QURT does not support configuration with termios.
+	dspal_serial_ioctl_data_rate data_rate;
+
+	switch (baud) {
+	case 9600: data_rate.bit_rate = DSPAL_SIO_BITRATE_9600; break;
+
+	case 19200: data_rate.bit_rate = DSPAL_SIO_BITRATE_19200; break;
+
+	case 38400: data_rate.bit_rate = DSPAL_SIO_BITRATE_38400; break;
+
+	case 57600: data_rate.bit_rate = DSPAL_SIO_BITRATE_57600; break;
+
+	case 115200: data_rate.bit_rate = DSPAL_SIO_BITRATE_115200; break;
+
+	default:
+		PX4_ERR("ERR: unknown baudrate: %d", baud);
+		return -EINVAL;
+	}
+
+	int ret = ::ioctl(_serial_fd, SERIAL_IOCTL_SET_DATA_RATE, (void *)&data_rate);
+
+	if (ret != 0) {
+
+		return ret;
+	}
+
+#else
+	/* process baud rate */
+	int speed;
+	printf("set baud:%d\n", baud);
+	switch (baud) {
+	case 9600:   speed = B9600;   break;
+
+	case 19200:  speed = B19200;  break;
+
+	case 38400:  speed = B38400;  break;
+
+	case 57600:  speed = B57600;  break;
+
+	case 115200: speed = B115200; break;
+
+	default:
+		PX4_ERR("ERR: unknown baudrate: %d", baud);
+		return -EINVAL;
+	}
+
+	struct termios uart_config;
+
+	int termios_state;
+
+	/* fill the struct for the new configuration */
+	tcgetattr(_serial_fd, &uart_config);
+
+	/* properly configure the terminal (see also https://en.wikibooks.org/wiki/Serial_Programming/termios ) */
+
+	//
+	// Input flags - Turn off input processing
+	//
+	// convert break to null byte, no CR to NL translation,
+	// no NL to CR translation, don't mark parity errors or breaks
+	// no input parity check, don't strip high bit off,
+	// no XON/XOFF software flow control
+	//
+	uart_config.c_iflag &= ~(IGNBRK | BRKINT | ICRNL |
+				 INLCR | PARMRK | INPCK | ISTRIP | IXON);
+	//
+	// Output flags - Turn off output processing
+	//
+	// no CR to NL translation, no NL to CR-NL translation,
+	// no NL to CR translation, no column 0 CR suppression,
+	// no Ctrl-D suppression, no fill characters, no case mapping,
+	// no local output processing
+	//
+	// config.c_oflag &= ~(OCRNL | ONLCR | ONLRET |
+	//                     ONOCR | ONOEOT| OFILL | OLCUC | OPOST);
+	uart_config.c_oflag = 0;
+
+	//
+	// No line processing
+	//
+	// echo off, echo newline off, canonical mode off,
+	// extended input processing off, signal chars off
+	//
+	uart_config.c_lflag &= ~(ECHO | ECHONL | ICANON | IEXTEN | ISIG);
+
+	/* no parity, one stop bit */
+	uart_config.c_cflag &= ~(CSTOPB | PARENB);
+
+	/* set baud rate */
+	if ((termios_state = cfsetispeed(&uart_config, speed)) < 0) {
+		PX4_ERR("ERR: %d (cfsetispeed)", termios_state);
+		return -1;
+	}
+
+	if ((termios_state = cfsetospeed(&uart_config, speed)) < 0) {
+		PX4_ERR("ERR: %d (cfsetospeed)", termios_state);
+		return -1;
+	}
+
+	if ((termios_state = tcsetattr(_serial_fd, TCSANOW, &uart_config)) < 0) {
+		PX4_ERR("ERR: %d (tcsetattr)", termios_state);
+		return -1;
+	}
+
+#endif
+	return 0;
+}
+
+
+int BATT_SMART::receive(unsigned timeout)
+{
+	/* timeout additional to poll */
+	uint64_t time_started = hrt_absolute_time();
+
+	int i = 0;
+	int num_read = 0;
+	//uint8_t buf[255+7+5];
+	//PX4_WARN("aaa");
+	while (true) {
+		//PX4_WARN("1");
+		/* then poll or read for new data */
+		num_read = pollOrRead(_buf, sizeof(_buf), timeout);
+		//PX4_WARN("2");
+		if (num_read < 0) {
+			/* something went wrong when polling */
+			return -1;
+
+		}
+
+		/* pass received bytes to the packet decoder */
+		while (i < num_read) {
+
+			//printf("num read:%d i:%d\n", num_read, i);
+			int len = 0;
+
+			len = parseChar(_buf[i]);
+			//printf("parse len:%d\n", len);
+			if (len > 0) {
+				/* return to configure during configuration or to the gps driver during normal work
+				 * if a packet has arrived */
+				if (handleMessage(len) > 0) {
+					//printf("handleMessage(len) > 0");
+					return 1;
+				}
+			}
+
+			i++;
+		}
+
+		/* everything is read */
+		i = num_read = 0;
+
+		/* in case we get crap from GPS or time out */
+		if (time_started + timeout * 1000  < hrt_absolute_time()) {
+			return -1;
+		}
+	}
+}
+
+int BATT_SMART::parseChar(uint8_t b)
+{
+	int iRet = 1;
+// //printf("decode in:%d  ", _decode_state);
+// 	switch (_decode_state) {
+// 		case wait_head:
+// 			if (b == BATT_BUS_HEAD) {
+// 				_decode_state = wait_command;
+// 				_param_bytes = 0;
+// 				_pec_bytes = 0;
+// 			}
+// 			break;
+// 		case wait_command:
+// 			_pec_buffer[_pec_bytes++] = b;
+// 			_command = b;
+// 			//printf("get cmd %d\n", _command);
+// 			_decode_state = wait_adrsn;
+// 			break;
+// 		case wait_adrsn:
+// 			_pec_buffer[_pec_bytes++] = b;
+// 			_id = b;
+// 			//printf("get id %d\n", _id);
+// 			_decode_state = wait_paramnum;
+// 			break;
+// 		case wait_paramnum:
+// 			_pec_buffer[_pec_bytes++] = b;
+// 			_paramnum = b;
+// 			//printf("get param num %d\n", _paramnum);
+// 			_decode_state = wait_sot;
+// 			break;
+// 		case wait_sot:
+// 			if (b == BATT_BUS_SOT) {
+// 				_pec_buffer[_pec_bytes++] = b;
+// 				if(_paramnum > 0)
+// 				{
+// 					//printf("get sot\n param:");
+// 					_decode_state = wait_param;
+// 				}
+// 				else
+// 				{
+// 					_decode_state = wait_pec;
+// 					printf("get sot,but param=0\n");
+// 				}
+// 			}
+// 			else
+// 			{
+// 				printf("get sot error\n");
+// 				_decode_state = wait_head;
+// 			}
+// 			break;
+// 		case wait_param:
+// 			_pec_buffer[_pec_bytes++] = b;
+// 			//_param_buffer[_param_bytes++] = b;
+// 			_param_bytes++;
+// 			//printf("%x ", b);
+// 			if(_param_bytes >= _paramnum)
+// 			{
+// 				//printf("\n");
+// 				_decode_state = wait_pec;
+// 			}
+// 			break;
+// 		case wait_pec:
+// 		{
+// 			uint8_t pec = cal_PEC(_pec_buffer, _pec_bytes);
+// 			//uint8_t pec = cal_PEC2(_pec_buffer, _pec_bytes);
+// //			printf("\n****************\n");
+// //			printf("pec: num:%d cal:%x get:%x \n", _pec_bytes, pec, b);
+// //			for(int i=0; i<_pec_bytes; i++)
+// //			{
+// //				printf("%02x ", _pec_buffer[i]);
+// //			}
+// //			printf("\n****************\n\n");
+// 			if(pec == b)
+// 			{
+// 				//printf("get pec right\n");
+// 				_decode_state = wait_eot;
+// 			}
+// 			else
+// 			{
+// 				printf("pec:%x cal:%x\n", b, pec);
+// 				_decode_state = wait_head;
+// 			    _error_frame_cnt++;
+// 			}
+// 		    _frame_cnt++;
+// 			//printf("total:%d  err:%d\n", _frame_cnt, _error_frame_cnt);
+// 			break;
+// 		}
+// 		case wait_eot:
+// 			if (b == BATT_BUS_EOT) {
+// 				//printf("get eot\n");
+// 				_decode_state = wait_head;
+// 				iRet = _paramnum;
+// 				_param_buffer = &_pec_buffer[4];
+// 			}
+// 			else
+// 			{
+// 				_decode_state = wait_head;
+// 			}
+// 			break;
+// 		default:
+// 			_decode_state = wait_head;
+// 			break;
+// 	}
+// //printf(" out:%d\n", _decode_state);
+	return iRet;
+}
+
+int BATT_SMART::handleMessage(int len)
+{
+	return 1;
+}
+
+
+
+void BATT_SMART::print_info()
+{
+
+}
+
+
+int BATT_SMART::pollOrRead(uint8_t *buf, size_t buf_length, int timeout)
+{
+#ifndef __PX4_QURT
+
+	/* For non QURT, use the usual polling. */
+
+	//Poll only for the serial data. In the same thread we also need to handle orb messages,
+	//so ideally we would poll on both, the serial fd and orb subscription. Unfortunately the
+	//two pollings use different underlying mechanisms (at least under posix), which makes this
+	//impossible. Instead we limit the maximum polling interval and regularly check for new orb
+	//messages.
+	//FIXME: add a unified poll() API
+	const int max_timeout = 20;
+
+	pollfd fds[1];
+	fds[0].fd = _serial_fd;
+	fds[0].events = POLLIN;
+
+	int ret = poll(fds, sizeof(fds) / sizeof(fds[0]), math::min(max_timeout, timeout));
+
+	// /*test code*/
+	printf("poll ret:%d\n", ret);
+	
+	if (ret > 0) {
+		/* if we have new data from GPS, go handle it */
+		if (fds[0].revents & POLLIN) {
+			/*
+			 * We are here because poll says there is some data, so this
+			 * won't block even on a blocking device. But don't read immediately
+			 * by 1-2 bytes, wait for some more data to save expensive read() calls.
+			 * If more bytes are available, we'll go back to poll() again.
+			 */
+			usleep(BATT_WAIT_BEFORE_READ * 1000);
+			ret = ::read(_serial_fd, buf, buf_length);
+
+			/*test code*/
+			// printf("read ret:%d\n", ret);
+			// if(ret > 0)
+			// {
+			// 	printf("\n****************\n");
+			// 	printf("read: num:%d  \n", ret);
+			// 	for(int i=0; i<ret; i++)
+			// 	{
+			// 		printf("%02x ", buf[i]);
+			// 	}
+			// 	printf("\n****************\n\n");
+			// }
+			/*end test*/
+
+		} else {
+			ret = -1;
+		}
+	}
+
+	return ret;
+
+#else
+	/* For QURT, just use read for now, since this doesn't block, we need to slow it down
+	 * just a bit. */
+	usleep(10000);
+	return ::read(_serial_fd, buf, buf_length);
+#endif
+}
+
+int
+BATT_SMART::test()
+{
+
+	return OK;
+}
+
+void
+BATT_SMART::shut()
+{
+	_shut = !_shut;
+}
+
+
+/**
+ * Local functions in support of the shell command.
+ */
+namespace batt_smart
+{
+/* oddly, ERROR is not defined for c++ */
+#ifdef ERROR
+# undef ERROR
+#endif
+const int ERROR = -1;
+
+
+void   	start(const char *uart_path);
+void	stop();
+void	test();
+void	reset();
+void	status();
+void	usage();
+void   	shut();
+
+void start(const char *uart_path)
+{
+	if (g_dev != nullptr) {
+		PX4_WARN("batt_smart already started");
+		return;
+	}
+
+	/* create the driver */
+	g_dev = new BATT_SMART(uart_path);
+
+	if (!g_dev || OK != g_dev->init()) {
+		if (g_dev != nullptr) {
+			delete g_dev;
+			g_dev = nullptr;
+		}
+
+		PX4_ERR("start of batt_smart failed");
+	}
+}
+
+
+/**
+ * Stop the driver.
+ */
+void
+stop()
+{
+	delete g_dev;
+	g_dev = nullptr;
+}
+
+void test()
+{
+	if (g_dev == nullptr) {
+		PX4_WARN("batt_smart not started");
+		return;
+	}
+
+	g_dev->test();
+}
+
+void reset()
+{
+
+}
+
+void shut()
+{
+	if (g_dev == nullptr) {
+		PX4_WARN("batt_smart not started");
+		return;
+	}
+
+	g_dev->shut();
+}
+
+void status()
+{
+	if (g_dev == nullptr) {
+		PX4_WARN("batt_smart not started");
+		return;
+	}
+	g_dev->print_info();
+}
+
+void usage()
+{
+	fprintf(stderr,
+		"usage: batt_smart start [-d <devicename>]\n"
+		"       batt_smart stop\n"
+		"       batt_smart status\n");
+	exit(1);
+}
+
+
+
+} // namespace
+
+
+int
+dist_lidar_main(int argc, char *argv[])
+{
+	/* set to default */
+	const char *device_name = BATT_DEFAULT_UART_PORT;
+
+	if (argc < 2) {
+		warnx("missing command");
+		batt_smart::usage();
+	}
+
+	if (!strcmp(argv[1], "start")) {
+
+		/* work around getopt unreliability */
+		if (argc > 3) {
+			if (!strcmp(argv[2], "-d")) {
+				device_name = argv[3];
+
+			} else {
+				PX4_ERR("DID NOT GET -d");
+				goto out;
+			}
+		}
+
+		batt_smart::start(device_name);
+
+
+	}
+
+	if (!strcmp(argv[1], "stop")) {
+		batt_smart::stop();
+	}
+
+	/*
+	 * Test the driver/device.
+	 */
+	if (!strcmp(argv[1], "test")) {
+		batt_smart::test();
+	}
+
+	/*
+	 * Reset the driver.
+	 */
+	if (!strcmp(argv[1], "reset")) {
+		batt_smart::reset();
+	}
+
+	/*
+	 * shut data, for connect test.
+	 */
+	if (!strcmp(argv[1], "shut")) {
+		batt_smart::shut();
+	}
+
+
+	/*
+	 * Print driver status.
+	 */
+	if (!strcmp(argv[1], "status")) {
+		batt_smart::status();
+	}
+	return 0;
+
+out:
+	PX4_ERR("unrecognized command, try 'start', 'stop', 'test', 'reset' or 'status'\n [-d /dev/ttyS0-n]");
+	return 1;
+}
